@@ -1,0 +1,249 @@
+#' AUC for binary labels (no extra dependencies)
+#'
+#' Computes the area under the ROC curve using the rank-based Mann–Whitney formulation.
+#'
+#' @param score Numeric vector of scores.
+#' @param label Integer or logical vector; treated as 0/1 labels.
+#' @return Numeric scalar AUC in [0, 1], or NA if labels are degenerate.
+#' @export
+auc_binary <- function(score, label) {
+  # label: 0/1; score: numeric, same length
+  stopifnot(length(score) == length(label))
+  label <- as.integer(label)
+  n_pos <- sum(label == 1L)
+  n_neg <- sum(label == 0L)
+  if (n_pos == 0L || n_neg == 0L) return(NA_real_)
+
+  ranks <- rank(score, ties.method = "average")
+  pos_idx <- which(label == 1L)
+  sum_ranks_pos <- sum(ranks[pos_idx])
+
+  auc <- (sum_ranks_pos - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  return(as.numeric(auc))
+}
+
+#' Simulate a two-sense trajectory with an ODE baseline, noise, and a transient shock
+#'
+#' The baseline follows the reduced LV-ODE in the two-sense simplex (x1 + x2 = 1),
+#' and the observed trajectory is generated as baseline + Gaussian noise + a single-peak
+#' bump shock within a specified time window.
+#'
+#' @param t Numeric vector of time points (default 0:100).
+#' @param r1,sigma1 ODE parameters.
+#' @param x0 Initial condition for x1 at t[1].
+#' @param noise_sd Standard deviation of Gaussian noise added to x1.
+#' @param shock_start,shock_end Integer window for the shock.
+#' @param shock_amp Shock amplitude.
+#' @param seed Optional integer for reproducibility. If provided, the RNG state is restored.
+#' @return A data.frame with baseline, noisy, and shocked trajectories.
+#' @export
+simulate_one_trajectory <- function(
+    t            = 0:100,
+    r1           = 0.06,
+    sigma1       = 0.2,
+    x0           = 0.15,
+    noise_sd     = 0.02,
+    shock_start  = 40,
+    shock_end    = 60,
+    shock_amp    = 0.25,
+    seed         = NULL
+) {
+  t <- as.numeric(t)
+  n <- length(t)
+
+  # Preserve RNG state if a seed is provided
+  if (!is.null(seed)) {
+    old_seed <- if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) get(".Random.seed", envir = .GlobalEnv) else NULL
+    on.exit({
+      if (!is.null(old_seed)) assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    }, add = TRUE)
+    set.seed(seed)
+  }
+
+  # Effective growth rate: dx1/dt = r1 * (1 - sigma1) * x1 * (1 - x1)
+  r_eff <- r1 * (1 - sigma1)
+
+  # Closed-form logistic baseline on [0, 1]
+  x1_base <- 1 / (1 + ((1 - x0) / x0) * exp(-r_eff * (t - min(t))))
+  x1_base <- pmin(pmax(x1_base, 0), 1)
+  x2_base <- 1 - x1_base
+
+  # Baseline + Gaussian noise
+  noise <- stats::rnorm(n, mean = 0, sd = noise_sd)
+  x1_orig <- x1_base + noise
+  x1_orig[x1_orig < 0] <- 0
+  x1_orig[x1_orig > 1] <- 1
+  x2_orig <- 1 - x1_orig
+
+  # Single-peak bump shock within [shock_start, shock_end]
+  shock <- rep(0, n)
+  idx_shock <- which(t >= shock_start & t <= shock_end)
+  if (length(idx_shock) > 0) {
+    shock[idx_shock] <- shock_amp * sin(pi * (t[idx_shock] - shock_start) / (shock_end - shock_start))
+    shock[shock < 0] <- 0
+  }
+
+  x1_after <- x1_orig + shock
+  x1_after[x1_after < 0] <- 0
+  x1_after[x1_after > 1] <- 1
+  x2_after <- 1 - x1_after
+
+  shock_total <- x1_after - x1_base
+
+  data.frame(
+    t           = t,
+    x1_base     = x1_base,
+    x2_base     = x2_base,
+    x1_orig     = x1_orig,
+    x2_orig     = x2_orig,
+    shock       = shock,
+    x1_after    = x1_after,
+    x2_after    = x2_after,
+    shock_total = shock_total
+  )
+}
+
+#' Evaluate shock detection performance for a trajectory
+#'
+#' @param traj A data.frame returned by `simulate_one_trajectory()`.
+#' @param score Numeric vector of a shock index S(t), same length as traj$t.
+#' @param shock_start,shock_end Shock window used to define ground-truth labels.
+#' @return A one-row data.frame with AUC and auxiliary diagnostics.
+#' @export
+evaluate_shock_detection <- function(traj, score, shock_start, shock_end) {
+  t <- traj$t
+  stopifnot(length(score) == length(t))
+
+  # Ground-truth label: 1 inside shock window, else 0
+  label <- ifelse(t >= shock_start & t <= shock_end, 1L, 0L)
+
+  auc <- auc_binary(score, label)
+
+  score_in  <- score[label == 1L]
+  score_out <- score[label == 0L]
+  mean_in   <- mean(score_in,  na.rm = TRUE)
+  mean_out  <- mean(score_out, na.rm = TRUE)
+  diff_in_out <- mean_in - mean_out
+
+  max_idx <- which.max(score)
+  max_t   <- t[max_idx]
+  max_in_window <- (max_t >= shock_start && max_t <= shock_end)
+
+  data.frame(
+    auc           = auc,
+    mean_in       = mean_in,
+    mean_out      = mean_out,
+    diff_in_out   = diff_in_out,
+    max_t         = max_t,
+    max_in_window = max_in_window
+  )
+}
+
+#' Default shock index function
+#'
+#' @param traj A data.frame returned by `simulate_one_trajectory()`.
+#' @return Numeric vector S(t).
+#' @export
+default_index_fun <- function(traj) {
+  # By default, use deviation from the ODE baseline
+  traj$shock_total
+}
+
+#' Run repeated simulations and summarize detection metrics
+#'
+#' @param n_rep Number of repetitions.
+#' @param ... Passed to `simulate_one_trajectory()`.
+#' @param index_fun Function mapping a trajectory to a score vector.
+#' @return A data.frame of per-replicate metrics.
+#' @export
+run_shock_simulation <- function(
+    n_rep        = 100,
+    t            = 0:100,
+    r1           = 0.06,
+    sigma1       = 0.2,
+    x0           = 0.15,
+    noise_sd     = 0.02,
+    shock_start  = 40,
+    shock_end    = 60,
+    shock_amp    = 0.25,
+    index_fun    = default_index_fun,
+    seed         = NULL
+) {
+  metrics_list <- vector("list", n_rep)
+
+  # Optional top-level seed for reproducibility across replicates
+  if (!is.null(seed)) {
+    old_seed <- if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) get(".Random.seed", envir = .GlobalEnv) else NULL
+    on.exit({
+      if (!is.null(old_seed)) assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    }, add = TRUE)
+    set.seed(seed)
+  }
+
+  for (i in seq_len(n_rep)) {
+    traj <- simulate_one_trajectory(
+      t           = t,
+      r1          = r1,
+      sigma1      = sigma1,
+      x0          = x0,
+      noise_sd    = noise_sd,
+      shock_start = shock_start,
+      shock_end   = shock_end,
+      shock_amp   = shock_amp
+    )
+
+    score <- index_fun(traj)
+
+    metrics_list[[i]] <- evaluate_shock_detection(
+      traj        = traj,
+      score       = score,
+      shock_start = shock_start,
+      shock_end   = shock_end
+    )
+  }
+
+  metrics <- do.call(rbind, metrics_list)
+  rownames(metrics) <- NULL
+  metrics
+}
+
+#' Plot an example trajectory (baseline vs observed vs shocked) and its deviation
+#'
+#' @param traj A data.frame returned by `simulate_one_trajectory()`.
+#' @param shock_start,shock_end Shock window used for vertical markers.
+#' @return Invisibly returns NULL.
+#' @export
+plot_shock_trajectory <- function(traj, shock_start = 40, shock_end = 60) {
+  old_par <- graphics::par(no.readonly = TRUE)
+  on.exit(graphics::par(old_par), add = TRUE)
+  graphics::par(mfrow = c(2, 1), mar = c(3, 4, 2, 2))
+
+  graphics::plot(traj$t, traj$x1_base, type = "l", lwd = 2,
+                 ylim = c(0, 1), xlab = "Time", ylab = "x1",
+                 main = "x1: ODE baseline, original, and after shock")
+  graphics::lines(traj$t, traj$x1_orig, col = "grey50")
+  graphics::lines(traj$t, traj$x1_after, col = "firebrick", lwd = 2)
+  graphics::abline(v = shock_start, col = "red", lty = 2)
+  graphics::abline(v = shock_end,   col = "red", lty = 2)
+  graphics::legend("topleft", bty = "n", cex = 0.8,
+                   legend = c("ODE baseline", "Original", "After shock"),
+                   col    = c("black", "grey50", "firebrick"),
+                   lwd    = c(2, 1, 2))
+
+  graphics::plot(traj$t, traj$shock_total, type = "l", lwd = 2,
+                 xlab = "Time", ylab = "After - ODE baseline",
+                 main = "Observed deviation from ODE baseline")
+  graphics::abline(v = shock_start, col = "red", lty = 2)
+  graphics::abline(v = shock_end,   col = "red", lty = 2)
+
+  invisible(NULL)
+}
+
+#' Load an example simulated trajectory shipped with the package
+#'
+#' @return A data.frame.
+#' @export
+example_sim_trajectory <- function() {
+  path <- system.file("extdata", "sim_traj_example.csv", package = "sdelex")
+  utils::read.csv(path)
+}
