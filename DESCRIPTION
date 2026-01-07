@@ -2,7 +2,10 @@ Package: r.SDE.Bayesian
 Title: Stochastic Differential Equation Modeling for Lexical Semantic Change
 Version: 0.0.0.9000
 Authors@R: 
-    person("Xuan", "Zhang", "xuanzhang0116@163.com")
+    person(given = "Xuan",
+           family = "Zhang",
+           email = "xuanzhang0116@163.com",
+           role = c("aut", "cre"))
 Description: 
   This package implements a stochastic modeling framework for lexical semantic change,
   particularly focused on the competition between word senses over time. The framework
